@@ -1,0 +1,83 @@
+name: CI – Tests & Linting
+
+on:
+  push:
+    branches: ["**"]          # alle Branches
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Tests + Linting (Python 3.12)
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: insolvenz
+          POSTGRES_PASSWORD: testpassword
+          POSTGRES_DB: insolvenz_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    steps:
+      - name: Code auschecken
+        uses: actions/checkout@v4
+
+      - name: Python 3.12 einrichten
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: backend/pyproject.toml
+
+      - name: Dependencies installieren
+        working-directory: backend
+        run: pip install -e ".[dev]"
+
+      - name: Ruff – Code-Stil prüfen
+        working-directory: backend
+        run: ruff check .
+
+      - name: Mypy – Typen prüfen
+        working-directory: backend
+        run: mypy app/
+
+      - name: Pytest – Tests ausführen
+        working-directory: backend
+        env:
+          ENVIRONMENT: development
+          DEBUG: "true"
+          DATABASE_URL: postgresql+asyncpg://insolvenz:testpassword@localhost:5432/insolvenz_test
+          REDIS_URL: redis://localhost:6379/0
+          SECRET_KEY: test-secret-key-only-for-ci-not-production
+          DB_ENCRYPTION_KEY: test-encryption-key-only-for-ci-000000
+          POSTGRES_USER: insolvenz
+          POSTGRES_PASSWORD: testpassword
+          POSTGRES_DB: insolvenz_test
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: testpassword
+          ALLOWED_ORIGINS: '["http://localhost:3000"]'
+        run: pytest tests/ -v --cov=app --cov-report=xml
+
+      - name: Coverage-Report hochladen
+        uses: codecov/codecov-action@v4
+        if: always()
+        with:
+          file: backend/coverage.xml

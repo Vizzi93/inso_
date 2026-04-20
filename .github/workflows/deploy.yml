@@ -1,0 +1,98 @@
+name: Deploy – Produktion
+
+on:
+  push:
+    branches: [main]     # nur main deployt automatisch
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/insolvenz-api
+
+jobs:
+  # ── Schritt 1: Tests müssen grün sein ──────────────────────
+  test:
+    uses: ./.github/workflows/ci.yml   # CI-Workflow wiederverwenden
+
+  # ── Schritt 2: Docker Image bauen & pushen ─────────────────
+  build:
+    name: Docker Build & Push
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write    # für ghcr.io Push
+
+    outputs:
+      image_tag: ${{ steps.meta.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Container Registry Login
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image-Metadaten (Tag = Git-SHA)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=,format=short
+            type=raw,value=latest
+
+      - name: Docker Image bauen & pushen
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ── Schritt 3: Auf Server deployen ────────────────────────
+  deploy:
+    name: Server Deployment
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: SSH – Pull & Rolling Restart
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SERVER_IP }}
+          username: deploy
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            set -e
+            cd /opt/insolvenz-manager
+
+            # Neues Image-Tag setzen
+            export IMAGE_TAG=${{ needs.build.outputs.image_tag }}
+            echo "IMAGE_TAG=${IMAGE_TAG}" > .image_tag
+
+            # Image ziehen (nur API + Worker, DB bleibt unangetastet)
+            docker compose -f docker-compose.prod.yml pull api worker
+
+            # Container neu starten ohne Downtime
+            docker compose -f docker-compose.prod.yml up -d --no-deps api worker
+
+            # Health Check (max 30 Sekunden warten)
+            echo "Warte auf Health Check..."
+            for i in $(seq 1 6); do
+              STATUS=$(curl -sf http://localhost:8000/api/health | python3 -c "import sys,json; print(json.load(sys.stdin)['status'])" 2>/dev/null || echo "fail")
+              if [ "$STATUS" = "ok" ]; then
+                echo "Health Check erfolgreich nach ${i}x5s"
+                exit 0
+              fi
+              sleep 5
+            done
+
+            # Health Check fehlgeschlagen – Rollback
+            echo "Health Check fehlgeschlagen – Rollback wird eingeleitet"
+            bash /opt/insolvenz-manager/scripts/rollback.sh
+            exit 1
